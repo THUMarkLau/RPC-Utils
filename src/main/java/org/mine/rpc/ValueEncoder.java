@@ -57,8 +57,8 @@ public class ValueEncoder {
     /*
      * The structure of the encoded data is as follows:
      * [Number of lists]
-     * [Datatype of first value in the first list] [Datatype of second value in the first list] ... [end of first list]
-     * [Datatype of first value in the second list] [Datatype of second value in the second list] ... [end of second list]
+     * [length of first list] [Datatype of first value in the first list] [Datatype of second value in the first list] ... [end of first list]
+     * [length of second list] [Datatype of first value in the second list] [Datatype of second value in the second list] ... [end of second list]
      * ...
      * [First value of first list] [Second value of first list] ... [The last value of first list]
      * [First value of second list] [Second value of second list] ... [The last value of second list]
@@ -84,11 +84,11 @@ public class ValueEncoder {
     valueBuffer.writeInt(values.size()); // number of lists
     // encode type lists
     for (List<TSDataType> typeList : types) {
+      valueBuffer.writeInt(typeList.size());
       for (TSDataType type : typeList) {
         valueBuffer.write(type.getType());
       }
       totalOriginalSize.addAndGet(typeList.size());
-      valueBuffer.write((byte) -1);
     }
     LOGGER.debug(
         "\t\tTime for encoding type lists = " + (System.nanoTime() - startTime) / 1000000.0 + "ms");
@@ -182,11 +182,11 @@ public class ValueEncoder {
     ByteBuffer uncompressedDataBuffer = ByteBuffer.wrap(uncompressed);
     int listSize = uncompressedDataBuffer.getInt();
     for (int i = 0; i < listSize; ++i) {
-      List<TSDataType> typeList = new ArrayList<>();
-      byte type = uncompressedDataBuffer.get();
-      while (type != -1) {
+      int size = uncompressedDataBuffer.getInt();
+      List<TSDataType> typeList = new ArrayList<>(size);
+      for (int j = 0; j < size; ++j) {
+        byte type = uncompressedDataBuffer.get();
         typeList.add(TSDataType.deserialize(type));
-        type = uncompressedDataBuffer.get();
       }
       dataTypes.add(typeList);
     }
