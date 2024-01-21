@@ -51,23 +51,24 @@ public class ValueEncoder {
   private static LZ4FastDecompressor decompressor = factory.fastDecompressor();
   private static LZ4SafeDecompressor safeDecompressor = factory.safeDecompressor();
 
+  /*
+   * The structure of encoded buffer is:
+   * [Data Compressed Flag (byte)] [Data Size (int)] [(Maybe compressed)Data (byte[])]
+   * [Time Compressed Flag (byte)] [Time Size (int)] [(Maybe compressed)Time (byte[])]
+   *
+   * The structure of the data part is as follows:
+   * [Number of lists (int)]
+   * [length of first list (int)] [Datatype of each element in the first list (byte)] ...
+   * [length of second list (int)] [Datatype of each element in the second list (byte)] ...
+   * ...
+   * [First value of first list] [Second value of first list] ... [The last value of first list]
+   * [First value of second list] [Second value of second list] ... [The last value of second list]
+   * ...
+   *
+   */
   public static ByteBuffer encode(
       List<List<Object>> values, List<List<TSDataType>> types, List<Long> timestamps)
       throws IOException {
-    /*
-     * The structure of the encoded data is as follows:
-     * [Number of lists]
-     * [length of first list] [Datatype of first value in the first list] [Datatype of second value in the first list] ... [end of first list]
-     * [length of second list] [Datatype of first value in the second list] [Datatype of second value in the second list] ... [end of second list]
-     * ...
-     * [First value of first list] [Second value of first list] ... [The last value of first list]
-     * [First value of second list] [Second value of second list] ... [The last value of second list]
-     * ...
-     *
-     * The number of lists is encoded as an integer.
-     * The end of each list is encoded as -1.
-     * The string value is encoded as a string, and the end of the string is encoded as '\0'.
-     */
 
     // calculate the size of buffer
     long originStartTime = System.nanoTime();
@@ -134,29 +135,50 @@ public class ValueEncoder {
         "\t\tTime for encoding value lists = "
             + (System.nanoTime() - startTime) / 1000000.0
             + "ms");
-    startTime = System.nanoTime();
-    ICompressor compressor = new ICompressor.IOTDBLZ4Compressor();
-    byte[] compressed = compressor.compress(valueBuffer.getBuf());
-    long time = System.nanoTime() - startTime;
-    LOGGER.debug("\t\tTime for compressing values = " + time / 1000000.0 + "ms");
-
-    startTime = System.nanoTime();
-    Encoder encoder =
-        TSEncodingBuilder.getEncodingBuilder(TSEncoding.TS_2DIFF).getEncoder(TSDataType.INT64);
-    PublicBAOS timeBuffer = new PublicBAOS();
-    for (long timestamp : timestamps) {
-      encoder.encode(timestamp, timeBuffer);
+    byte[] compressed = null;
+    if (RPCUtilsConfig.useValueCompression) {
+      startTime = System.nanoTime();
+      ICompressor compressor = new ICompressor.IOTDBLZ4Compressor();
+      compressed = compressor.compress(valueBuffer.getBuf());
+      long time = System.nanoTime() - startTime;
+      LOGGER.debug("\t\tTime for compressing values = " + time / 1000000.0 + "ms");
+    } else {
+      compressed = valueBuffer.getBuf();
     }
-    totalOriginalSize.addAndGet(timestamps.size() * 8L);
-    encoder.flush(timeBuffer);
-    byte[] timeBytes = timeBuffer.toByteArray();
-    LOGGER.debug(
-        "\t\tTime for encoding timestamps = " + (System.nanoTime() - startTime) / 1000000.0 + "ms");
+
+    byte[] timeBytes = null;
+    if (RPCUtilsConfig.useTimeCompression) {
+      startTime = System.nanoTime();
+      Encoder encoder =
+          TSEncodingBuilder.getEncodingBuilder(TSEncoding.TS_2DIFF).getEncoder(TSDataType.INT64);
+      PublicBAOS timeBuffer = new PublicBAOS();
+      for (long timestamp : timestamps) {
+        encoder.encode(timestamp, timeBuffer);
+      }
+      totalOriginalSize.addAndGet(timestamps.size() * 8L);
+      encoder.flush(timeBuffer);
+      timeBytes = timeBuffer.toByteArray();
+      LOGGER.debug(
+          "\t\tTime for encoding timestamps = "
+              + (System.nanoTime() - startTime) / 1000000.0
+              + "ms");
+    } else {
+      ByteBuffer timeBuffer = ByteBuffer.allocate(timestamps.size() * 8);
+      for (long timestamp : timestamps) {
+        timeBuffer.putLong(timestamp);
+      }
+      timeBuffer.flip();
+      timeBytes = timeBuffer.array();
+    }
     startTime = System.nanoTime();
     // try to decode the times
-    ByteBuffer buffer = ByteBuffer.allocateDirect(compressed.length + timeBytes.length + 8);
+    ByteBuffer buffer = ByteBuffer.allocateDirect(compressed.length + timeBytes.length + 8 + 2);
+    buffer.put(
+        RPCUtilsConfig.useValueCompression ? RPCUtilsConstant.COMPRESSED : RPCUtilsConstant.RAW);
     buffer.putInt(compressed.length);
     buffer.put(compressed);
+    buffer.put(
+        RPCUtilsConfig.useTimeCompression ? RPCUtilsConstant.COMPRESSED : RPCUtilsConstant.RAW);
     buffer.putInt(timeBytes.length);
     buffer.put(timeBytes);
     buffer.flip();
@@ -174,11 +196,17 @@ public class ValueEncoder {
       List<List<TSDataType>> dataTypes,
       List<Long> timestamps)
       throws IOException {
+    byte valueCompressionFlag = buffer.get();
     int dataSize = buffer.getInt();
     byte[] dataByteArray = new byte[dataSize];
     buffer.get(dataByteArray);
-    IUnCompressor unCompressor = new IUnCompressor.LZ4UnCompressor();
-    byte[] uncompressed = unCompressor.uncompress(dataByteArray);
+    byte[] uncompressed = null;
+    if (valueCompressionFlag == 1) {
+      IUnCompressor unCompressor = new IUnCompressor.LZ4UnCompressor();
+      uncompressed = unCompressor.uncompress(dataByteArray);
+    } else {
+      uncompressed = dataByteArray;
+    }
     ByteBuffer uncompressedDataBuffer = ByteBuffer.wrap(uncompressed);
     int listSize = uncompressedDataBuffer.getInt();
     for (int i = 0; i < listSize; ++i) {
@@ -221,13 +249,20 @@ public class ValueEncoder {
       values.add(valueList);
     }
 
+    byte timeCompressionFlag = buffer.get();
     int timeSize = buffer.getInt();
-    byte[] timeByteArray = new byte[timeSize];
-    buffer.get(timeByteArray, 0, timeSize);
-    Decoder decoder = Decoder.getDecoderByType(TSEncoding.TS_2DIFF, TSDataType.INT64);
-    ByteBuffer timeBuffer = ByteBuffer.wrap(timeByteArray);
-    while (decoder.hasNext(timeBuffer)) {
-      timestamps.add(decoder.readLong(timeBuffer));
+    if (timeCompressionFlag == 1) {
+      byte[] timeByteArray = new byte[timeSize];
+      buffer.get(timeByteArray, 0, timeSize);
+      Decoder decoder = Decoder.getDecoderByType(TSEncoding.TS_2DIFF, TSDataType.INT64);
+      ByteBuffer timeBuffer = ByteBuffer.wrap(timeByteArray);
+      while (decoder.hasNext(timeBuffer)) {
+        timestamps.add(decoder.readLong(timeBuffer));
+      }
+    } else {
+      while (buffer.hasRemaining()) {
+        timestamps.add(buffer.getLong());
+      }
     }
   }
 
