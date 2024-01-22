@@ -221,6 +221,11 @@ public class ValueEncoder {
     for (int i = 0; i < listSize; ++i) {
       List<TSDataType> typeList = dataTypes.get(i);
       List<Object> valueList = new ArrayList<>(typeList.size());
+      /* Consideration: How about keeping the original buffer
+       * and only decode the value when it is inserted to the MemTable?
+       * This will save the time of decoding the buffer and the memory of the decoded values,
+       * because each List::add will convert a base type to an Object(e.g. int to Integer).
+       */
       for (TSDataType type : typeList) {
         switch (type) {
           case INT32:

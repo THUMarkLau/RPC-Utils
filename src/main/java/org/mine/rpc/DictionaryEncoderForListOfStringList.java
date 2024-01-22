@@ -1,22 +1,27 @@
-package org.mine.rpc; /*
-                       * Licensed to the Apache Software Foundation (ASF) under one
-                       * or more contributor license agreements.  See the NOTICE file
-                       * distributed with this work for additional information
-                       * regarding copyright ownership.  The ASF licenses this file
-                       * to you under the Apache License, Version 2.0 (the
-                       * "License"); you may not use this file except in compliance
-                       * with the License.  You may obtain a copy of the License at
-                       *
-                       *     http://www.apache.org/licenses/LICENSE-2.0
-                       *
-                       * Unless required by applicable law or agreed to in writing,
-                       * software distributed under the License is distributed on an
-                       * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-                       * KIND, either express or implied.  See the License for the
-                       * specific language governing permissions and limitations
-                       * under the License.
-                       */
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.mine.rpc;
 
+import org.apache.iotdb.tsfile.compress.ICompressor;
+import org.apache.iotdb.tsfile.compress.IUnCompressor;
+
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -28,7 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.mine.rpc.InsertRecordsSerializeInColumnUtils.totalOriginalSize;
 
 public class DictionaryEncoderForListOfStringList {
-  public static ByteBuffer encode(List<List<String>> list) {
+  public static ByteBuffer encode(List<List<String>> list) throws IOException {
     /*
      * Buffer structure:
      * [The number of strings] [The first string] [The second string] ...
@@ -75,10 +80,37 @@ public class DictionaryEncoderForListOfStringList {
       }
     }
     buffer.flip();
+    if (RPCUtilsConfig.useSchemaCompression) {
+      ICompressor compressor = new ICompressor.IOTDBLZ4Compressor();
+      byte[] compressed = compressor.compress(buffer.array());
+      ByteBuffer tempBuffer = ByteBuffer.allocateDirect(compressed.length + 5);
+      tempBuffer.put(RPCUtilsConstant.COMPRESSED);
+      tempBuffer.putInt(compressed.length);
+      tempBuffer.put(compressed);
+      buffer = tempBuffer;
+    } else {
+      ByteBuffer tempBuffer = ByteBuffer.allocateDirect(buffer.remaining() + 1);
+      tempBuffer.put(RPCUtilsConstant.RAW);
+      tempBuffer.put(buffer);
+      buffer = tempBuffer;
+    }
+    buffer.flip();
     return buffer;
   }
 
   public static List<List<String>> decode(ByteBuffer buffer) {
+    byte flag = buffer.get();
+    if (flag == RPCUtilsConstant.COMPRESSED) {
+      int length = buffer.getInt();
+      byte[] compressed = new byte[length];
+      buffer.get(compressed);
+      try {
+        IUnCompressor unCompressor = new IUnCompressor.LZ4UnCompressor();
+        buffer = ByteBuffer.wrap(unCompressor.uncompress(compressed));
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
     short dictionarySize = buffer.getShort();
     Map<Short, String> idStringMap = new LinkedHashMap<>();
     for (int i = 0; i < dictionarySize; i++) {
@@ -104,7 +136,7 @@ public class DictionaryEncoderForListOfStringList {
     return output;
   }
 
-  public static void main(String[] args) {
+  public static void main(String[] args) throws IOException {
     List<List<String>> testList = new ArrayList<>();
     List<String> list1 = Arrays.asList("s1", "s2", "s3", "s4", "s5", "s6", "s7");
     List<String> list2 = Arrays.asList("s1", "s2", "s3", "s4", "s6");

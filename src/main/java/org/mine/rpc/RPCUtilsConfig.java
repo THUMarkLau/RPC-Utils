@@ -19,6 +19,8 @@
 package org.mine.rpc;
 
 public class RPCUtilsConfig {
-  public static boolean useValueCompression = false;
-  public static boolean useTimeCompression = false;
+  public static boolean useValueCompression = true;
+  public static boolean useTimeCompression = true;
+  public static boolean useSchemaCompression = true;
+  public static boolean useStringValueCompression = true;
 }
